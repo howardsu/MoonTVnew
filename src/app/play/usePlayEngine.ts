@@ -50,6 +50,7 @@ import {
   processImageUrl,
 } from '@/lib/utils';
 import {
+  clearVideoCache,
   getSegmentProbe,
   loadCacheSettings,
   saveCacheSettings,
@@ -64,6 +65,12 @@ import {
 import { triggerGlobalError } from '@/components/GlobalErrorIndicator';
 
 import { wrapArtplayerPluginDanmuku } from './danmuku-live-font-size';
+import {
+  bindDeferredProgressSeek,
+  PROGRESS_PREVIEW_END,
+  PROGRESS_PREVIEW_MOVE,
+  ProgressPreviewMove,
+} from './deferred-progress-seek';
 import { useVideoActions } from './hooks/useVideoActions';
 import { useWakeLock } from './hooks/useWakeLock';
 import {
@@ -76,6 +83,18 @@ import {
   saveDanmakuSettings,
   SkipConfig,
 } from './play-utils';
+import { PreviewThumbnailer } from './preview-thumbnailer';
+
+/** 进度条悬停预览浮层的实时状态 */
+export interface PlayPreviewState {
+  visible: boolean;
+  /** 悬停对应的时间点（秒） */
+  time: number;
+  /** 相对进度条宽度的百分比水平位置（0-100） */
+  left: number;
+  /** 已抽取的预览图 dataURL；加载中 / 失败为 null */
+  image: string | null;
+}
 
 // 扩展 HTMLVideoElement 类型以支持 hls 属性
 declare global {
@@ -210,6 +229,8 @@ export function usePlayEngine() {
   // 进度不走 React state——它会以 250ms 的节奏回调，走 state 会让整页高频重渲染，
   // 这里直接更新 ArtPlayer 的设置项 tooltip。
   const prefetcherRef = useRef(getVideoPrefetcher());
+  const cacheClearPromiseRef = useRef<Promise<void> | null>(null);
+  const previousCacheEpisodeRef = useRef<number | null>(null);
 
   // 下一集预热（落地路线第 3 步）。独立实例，避免打断当前集的队列。
   // `nextWarmupKeyRef` 记录"已经为哪一集的哪个档位预热过"，防止重复排队。
@@ -364,6 +385,41 @@ export function usePlayEngine() {
   // 切集时清空"已试过的源"与"自动换源次数"：
   // 某个源只是这一集挂了，不代表下一集也挂，不该把惩罚带到下一集。
   useEffect(() => {
+    const previousEpisode = previousCacheEpisodeRef.current;
+    previousCacheEpisodeRef.current = currentEpisodeIndex;
+    // 切集或换源立即中止旧下载，是否删除已落盘缓存由清理开关单独决定。
+    prefetcherRef.current.stop();
+    getNextEpisodePrefetcher().stop();
+    if (
+      previousEpisode !== null &&
+      previousEpisode !== currentEpisodeIndex &&
+      loadCacheSettings().autoClearOnEpisodeChange
+    ) {
+      const previousClear = cacheClearPromiseRef.current;
+      const stopped = Promise.all([
+        prefetcherRef.current.stopAndWait(),
+        getNextEpisodePrefetcher().stopAndWait(),
+      ]);
+      // 新当前集可能正是已预热的下一集，同时保留它之后一集的预热。
+      const episodePrefix = `${currentSource}:${currentId}`;
+      const keepEpisodeKeys = [
+        `${episodePrefix}:${currentEpisodeIndex}`,
+        `${episodePrefix}:${currentEpisodeIndex + 1}`,
+      ];
+      const clearing = (async () => {
+        await previousClear;
+        await stopped;
+        await clearVideoCache(keepEpisodeKeys);
+      })().catch((error) => {
+        console.error('切集自动清理缓存失败:', error);
+      });
+      cacheClearPromiseRef.current = clearing;
+      void clearing.finally(() => {
+        if (cacheClearPromiseRef.current === clearing) {
+          cacheClearPromiseRef.current = null;
+        }
+      });
+    }
     triedSourcesRef.current = new Set();
     autoSwitchCountRef.current = 0;
     // 切集/换源后"下一集"的目标变了，旧的预热队列立刻作废。
@@ -430,6 +486,12 @@ export function usePlayEngine() {
   /** ArtPlayer 根节点，供把返回/标题 portal 进播放器（全屏也能看见） */
   const [playerHost, setPlayerHost] = useState<HTMLElement | null>(null);
   const danmukuPluginInstanceRef = useRef<any>(null); // 弹幕插件实例
+
+  // ---- 进度条悬停预览 ----
+  const previewThumbnailerRef = useRef<PreviewThumbnailer | null>(null);
+  const previewTimerRef = useRef<number | null>(null);
+  const previewRequestIdRef = useRef(0);
+  const [preview, setPreview] = useState<PlayPreviewState | null>(null);
   const lastDanmakuUrlRef = useRef<string>(''); // 上一次加载的弹幕 URL
   const pendingDanmakuVisibleRestoreRef = useRef<boolean | null>(null); // 切集后待恢复的弹幕可见状态
 
@@ -957,12 +1019,22 @@ export function usePlayEngine() {
       setVideoDoubanId(detailData.douban_id || 0);
       setDetail(detailData);
 
-      // 传入的起始集数超出本源可用集数范围时，直接定位到最后一集（而非回到第一集）
+      // 传入的起始集数超出本源可用集数范围时，直接定位到最后一集（而非回到第一集）。
+      // 以 URL 的 ep 为准，避免依赖可能尚未写入的 state / 播放记录。
+      const requestedEp = Number(
+        new URLSearchParams(window.location.search).get('ep')
+      );
+      const requestedIndex =
+        Number.isInteger(requestedEp) && requestedEp >= 1
+          ? requestedEp - 1
+          : currentEpisodeIndex;
       if (
         detailData.episodes.length > 0 &&
-        currentEpisodeIndex >= detailData.episodes.length
+        (requestedIndex < 0 || requestedIndex >= detailData.episodes.length)
       ) {
-        setCurrentEpisodeIndex(detailData.episodes.length - 1);
+        setCurrentEpisodeIndex(
+          requestedIndex < 0 ? 0 : detailData.episodes.length - 1
+        );
       }
 
       // 规范 URL 参数
@@ -1300,8 +1372,12 @@ export function usePlayEngine() {
       // 尝试跳转到当前正在播放的集数
       let targetIndex = currentEpisodeIndex;
 
-      // 如果当前集数超出新源的范围，则跳转到第一集
-      if (!newDetail.episodes || targetIndex >= newDetail.episodes.length) {
+      // 集数越界时夹取：大于新源最大集数则跳转最后一集，负数则回到第一集
+      if (!newDetail.episodes || newDetail.episodes.length === 0) {
+        targetIndex = 0;
+      } else if (targetIndex >= newDetail.episodes.length) {
+        targetIndex = newDetail.episodes.length - 1;
+      } else if (targetIndex < 0) {
         targetIndex = 0;
       }
 
@@ -1848,6 +1924,20 @@ export function usePlayEngine() {
         currentTime: number,
         horizonSeconds?: number
       ) => {
+        const clearing = cacheClearPromiseRef.current;
+        if (clearing) {
+          const episodeIndex = currentEpisodeIndexRef.current;
+          void clearing.then(() => {
+            if (
+              episodeIndex === currentEpisodeIndexRef.current &&
+              m3u8Url === currentVideoUrlRef.current &&
+              artPlayerRef.current
+            ) {
+              ensurePrefetch(m3u8Url, currentTime, horizonSeconds);
+            }
+          });
+          return;
+        }
         prefetcherRef.current.ensure({
           m3u8Url,
           currentTime,
@@ -1881,6 +1971,7 @@ export function usePlayEngine() {
        * 并且随集数/画质变化自动失效。
        */
       const warmupNextEpisode = () => {
+        if (cacheClearPromiseRef.current) return;
         if (!loadCacheSettings().enabled) return;
 
         const data = detailRef.current;
@@ -1927,6 +2018,21 @@ export function usePlayEngine() {
         const live = currentVideoUrlRef.current;
         if (!live) return;
         ensurePrefetch(live, currentTime, horizonSeconds);
+      };
+
+      const cacheModeLabels = {
+        low: '低档',
+        medium: '中档',
+        high: '高档',
+        custom: '自定义',
+      };
+      const restartCacheQueue = () => {
+        prefetcherRef.current.stop();
+        getNextEpisodePrefetcher().stop();
+        nextWarmupKeyRef.current = null;
+        if (loadCacheSettings().enabled) {
+          ensurePrefetchCurrent(artPlayerRef.current?.currentTime || 0);
+        }
       };
 
       /** 刷新「画质」设置项的 tooltip（同样走 DOM setter，不打断面板层级） */
@@ -1982,7 +2088,7 @@ export function usePlayEngine() {
         pip: true,
         autoSize: false,
         autoMini: false,
-        screenshot: false,
+        screenshot: true,
         setting: true,
         loop: false,
         flip: false,
@@ -1991,7 +2097,7 @@ export function usePlayEngine() {
         fullscreen: true,
         fullscreenWeb: true,
         subtitleOffset: false,
-        miniProgressBar: false,
+        miniProgressBar: true,
         mutex: true,
         playsInline: true,
         autoPlayback: false,
@@ -2337,6 +2443,55 @@ export function usePlayEngine() {
             },
           },
           {
+            name: '缓存模式',
+            html: '缓存模式',
+            tooltip: `${cacheModeLabels[loadCacheSettings().concurrencyMode]} · ${loadCacheSettings().concurrency} 个`,
+            selector: (['low', 'medium', 'high', 'custom'] as const).map((mode) => ({
+              html:
+                mode === 'custom'
+                  ? '自定义'
+                  : `${cacheModeLabels[mode]}（${{ low: 3, medium: 6, high: 9 }[mode]} 个）`,
+              value: mode,
+              default: mode === loadCacheSettings().concurrencyMode,
+            })),
+            onSelect: function (item: any) {
+              const settings = saveCacheSettings({
+                concurrencyMode: item.value,
+              });
+              restartCacheQueue();
+              return `${cacheModeLabels[settings.concurrencyMode]} · ${settings.concurrency} 个`;
+            },
+          },
+          {
+            name: '自定义缓存并发',
+            html: '自定义并发',
+            tooltip: `${loadCacheSettings().customConcurrency} 个`,
+            range: [loadCacheSettings().customConcurrency, 1, 32, 1],
+            onChange: function (item: any) {
+              return `${item.range[0]} 个`;
+            },
+            onRange: function (item: any) {
+              const settings = saveCacheSettings({
+                concurrencyMode: 'custom',
+                customConcurrency: Number(item.range[0]),
+              });
+              updateSettingPreservingPanel(artPlayerRef.current, {
+                name: '缓存模式',
+                tooltip: `自定义 · ${settings.concurrency} 个`,
+                selector: (['low', 'medium', 'high', 'custom'] as const).map((mode) => ({
+                  html:
+                    mode === 'custom'
+                      ? '自定义'
+                      : `${cacheModeLabels[mode]}（${{ low: 3, medium: 6, high: 9 }[mode]} 个）`,
+                  value: mode,
+                  default: mode === 'custom',
+                })),
+              });
+              restartCacheQueue();
+              return `${settings.concurrency} 个`;
+            },
+          },
+          {
             html: '缓存管理',
             onClick: function () {
               setShowCacheManager(true);
@@ -2357,6 +2512,8 @@ export function usePlayEngine() {
           },
         ],
       });
+
+      bindDeferredProgressSeek(artPlayerRef.current);
 
       const playerEl =
         (artPlayerRef.current.template?.$player as HTMLElement | undefined) ||
@@ -2672,6 +2829,167 @@ export function usePlayEngine() {
     detail,
   ]);
 
+  // -----------------------------------------------------------------------------
+  // 进度条悬停预览
+  // -----------------------------------------------------------------------------
+
+  // 抽帧器实例生命周期：切集 / 换源 / 去广告开关变化时重建，
+  // 其 loader 配置与主播放器完全一致，保证预览分片同样命中 Cache Storage / 同源代理。
+  useEffect(() => {
+    if (!libsReady || !videoUrl) return;
+    const Hls = hlsLibRef.current;
+    if (!Hls) return;
+
+    const thumb = new PreviewThumbnailer();
+    previewThumbnailerRef.current?.destroy();
+    previewThumbnailerRef.current = thumb;
+    thumb.load(
+      videoUrl,
+      Hls,
+      createCustomHlsLoader(Hls, {
+        blockAd: blockAdEnabledRef.current,
+        useProxy: loadCacheSettings().useProxy,
+        // 预览抽帧不计入「缓存命中率」诊断，避免污染主播放器统计
+        onProbe: () => undefined,
+      })
+    );
+    setPreview(null);
+
+    return () => {
+      thumb.destroy();
+      if (previewThumbnailerRef.current === thumb) {
+        previewThumbnailerRef.current = null;
+      }
+    };
+  }, [libsReady, videoUrl, blockAdEnabled]);
+
+  // 鼠标悬停及拖动处理器共享预览；触摸抽帧串行执行，避免移动时反复取消。
+  // playerHost 变化代表播放器已重建（进度条 DOM 换新），需重新绑定。
+  useEffect(() => {
+    if (!playerHost) return;
+    const progressEl =
+      (artPlayerRef.current?.template?.$progress as HTMLElement | null) ||
+      (playerHost.querySelector('.art-progress') as HTMLElement | null);
+    if (!progressEl) return;
+
+    let dragging = false;
+    let touchTime: number | null = null;
+    let capturingTouch = false;
+    let capturedTouchTime: number | null = null;
+
+    const scheduleTouchCapture = () => {
+      if (
+        touchTime === null ||
+        capturingTouch ||
+        previewTimerRef.current !== null ||
+        touchTime === capturedTouchTime
+      ) {
+        return;
+      }
+      const id = previewRequestIdRef.current;
+      previewTimerRef.current = window.setTimeout(() => {
+        previewTimerRef.current = null;
+        const thumb = previewThumbnailerRef.current;
+        const time = touchTime;
+        if (!thumb || time === null) return;
+        capturingTouch = true;
+        capturedTouchTime = time;
+        thumb.capture(time).then((image) => {
+          if (id !== previewRequestIdRef.current) return;
+          capturingTouch = false;
+          // 保留上一帧直到新帧就绪；移动中的时间标签仍实时更新。
+          if (image) {
+            setPreview((p) => (p?.visible ? { ...p, image } : p));
+          }
+          scheduleTouchCapture();
+        });
+      }, 120);
+    };
+
+    const showPreview = (ratio: number, input: 'mouse' | 'touch') => {
+      const duration = artPlayerRef.current?.duration || 0;
+      if (!Number.isFinite(duration) || duration <= 0) return;
+      const time = ratio * duration;
+      setPreview((p) => ({
+        visible: true,
+        time,
+        left: ratio * 100,
+        image: p?.visible ? p.image : null,
+      }));
+      if (input === 'touch') {
+        touchTime = time;
+        scheduleTouchCapture();
+        return;
+      }
+      // 先使已在进行中的抽帧失效，避免旧图串到新位置
+      const id = ++previewRequestIdRef.current;
+      previewThumbnailerRef.current?.cancel();
+
+      if (previewTimerRef.current != null) clearTimeout(previewTimerRef.current);
+      previewTimerRef.current = window.setTimeout(() => {
+        previewTimerRef.current = null;
+        const thumb = previewThumbnailerRef.current;
+        if (!thumb) return;
+        thumb.capture(time).then((image) => {
+          if (id !== previewRequestIdRef.current) return;
+          setPreview((p) =>
+            image && p && p.visible && Math.abs(p.time - time) < 0.5
+              ? { ...p, image }
+              : p
+          );
+        });
+      }, 120);
+    };
+
+    const hidePreview = () => {
+      dragging = false;
+      touchTime = null;
+      capturedTouchTime = null;
+      capturingTouch = false;
+      if (previewTimerRef.current != null) {
+        clearTimeout(previewTimerRef.current);
+        previewTimerRef.current = null;
+      }
+      previewRequestIdRef.current++;
+      previewThumbnailerRef.current?.cancel();
+      setPreview((p) => (p ? { ...p, visible: false } : p));
+    };
+
+    const onDragMove = (event: Event) => {
+      const { ratio, input } = (event as CustomEvent<ProgressPreviewMove>).detail;
+      if (!dragging && input === 'touch') hidePreview();
+      dragging = true;
+      showPreview(ratio, input);
+    };
+    const onPointerMove = (e: PointerEvent) => {
+      // 触摸由拖动处理器驱动，不依赖浏览器是否产生 pointermove。
+      if (e.pointerType === 'touch' || dragging) return;
+      const rect = progressEl.getBoundingClientRect();
+      const rotated = artPlayerRef.current?.isRotate;
+      const size = rotated ? rect.height : rect.width;
+      if (size <= 0) return;
+      const offset = rotated ? e.clientY - rect.top : e.clientX - rect.left;
+      showPreview(Math.min(1, Math.max(0, offset / size)), 'mouse');
+    };
+    const onPointerLeave = () => {
+      if (!dragging) hidePreview();
+    };
+
+    progressEl.addEventListener(PROGRESS_PREVIEW_MOVE, onDragMove);
+    progressEl.addEventListener(PROGRESS_PREVIEW_END, hidePreview);
+    progressEl.addEventListener('pointermove', onPointerMove);
+    progressEl.addEventListener('pointerleave', onPointerLeave);
+
+    return () => {
+      progressEl.removeEventListener(PROGRESS_PREVIEW_MOVE, onDragMove);
+      progressEl.removeEventListener(PROGRESS_PREVIEW_END, hidePreview);
+      progressEl.removeEventListener('pointermove', onPointerMove);
+      progressEl.removeEventListener('pointerleave', onPointerLeave);
+      hidePreview();
+      setPreview(null);
+    };
+  }, [playerHost]);
+
   // 当组件卸载时清理定时器、Wake Lock 和播放器资源
   useEffect(() => {
     // 监听页面可见性变化
@@ -2761,6 +3079,7 @@ export function usePlayEngine() {
     // 播放器
     artRef,
     playerHost,
+    preview,
     isVideoLoading,
     videoLoadingStage,
     setLoading,
