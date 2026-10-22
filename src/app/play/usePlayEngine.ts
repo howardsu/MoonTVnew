@@ -38,11 +38,13 @@ import {
   resolveLevelHeight,
   savePreferredQualityHeight,
 } from '@/lib/hls-quality';
-import {
-  describeHlsError,
-  PlaybackRecovery,
-} from '@/lib/playback-recovery';
+import { describeHlsError, PlaybackRecovery } from '@/lib/playback-recovery';
 import { getDefaultPlaybackSaveInterval } from '@/lib/playback-settings';
+import {
+  getWarmupConcurrency,
+  shouldThrottlePrefetch,
+} from '@/lib/prefetch-scheduler';
+import { matchesFullSearchTitle } from '@/lib/search-title';
 import { SearchResult } from '@/lib/types';
 import {
   getRequestTimeout,
@@ -50,6 +52,7 @@ import {
   processImageUrl,
 } from '@/lib/utils';
 import {
+  CACHE_CONCURRENCY_PRESETS,
   clearVideoCache,
   getSegmentProbe,
   loadCacheSettings,
@@ -155,9 +158,11 @@ function buildCacheTooltip(
 
   const coverPart =
     stats.coverTo > 0 ? ` · 已覆盖 ${formatTime(stats.coverTo)}` : '';
+  // 个别分片坏掉不会终止整轮，但要让用户知道有缺口，而不是以为缓存完整。
+  const failedPart = stats.failed > 0 ? ` · ${stats.failed} 段失败` : '';
   const hitPart =
     hitRate === null ? '' : ` · 命中 ${Math.round(hitRate * 100)}%`;
-  return `${stats.cached}/${stats.total} 段${coverPart}${hitPart}`;
+  return `${stats.cached}/${stats.total} 段${coverPart}${failedPart}${hitPart}`;
 }
 
 /**
@@ -191,8 +196,10 @@ export function usePlayEngine() {
     outro_time: 0,
   });
   const skipConfigRef = useRef(skipConfig);
+  const restartPrefetchForSkipRef = useRef<(() => void) | null>(null);
   useEffect(() => {
     skipConfigRef.current = skipConfig;
+    restartPrefetchForSkipRef.current?.();
   }, [
     skipConfig,
     skipConfig.enable,
@@ -242,7 +249,9 @@ export function usePlayEngine() {
   >(null);
   const [selectedDanmakuAnime, setSelectedDanmakuAnime] =
     useState<AnimeOption | null>(null);
-  const [selectedDanmakuEpisode, setSelectedDanmakuEpisode] = useState<number | undefined>(undefined);
+  const [selectedDanmakuEpisode, setSelectedDanmakuEpisode] = useState<
+    number | undefined
+  >(undefined);
   const [showDanmakuSelector, setShowDanmakuSelector] = useState(false);
   const [showCacheManager, setShowCacheManager] = useState(false);
   const selectedDanmakuSourceRef = useRef<string | null>(null);
@@ -273,24 +282,24 @@ export function usePlayEngine() {
 
   // 自动匹配弹幕设置
   const [autoDanmakuEnabled, setAutoDanmakuEnabled] = useState(false);
-  const [preferredDanmakuPlatform, setPreferredDanmakuPlatform] = useState("bilibili1");
+  const [preferredDanmakuPlatform, setPreferredDanmakuPlatform] =
+    useState('bilibili1');
 
   const [currentTooltip, setCurrentTooltip] = useState('');
   const [selectedState, setSelectedState] = useState(false);
 
   useEffect(() => {
-    if (typeof window === "undefined") return;
+    if (typeof window === 'undefined') return;
 
-    const savedAuto = localStorage.getItem("autoDanmakuEnabled");
+    const savedAuto = localStorage.getItem('autoDanmakuEnabled');
     if (savedAuto !== null) {
       setAutoDanmakuEnabled(JSON.parse(savedAuto));
     }
 
-    const savedPlatform = localStorage.getItem("preferredDanmakuPlatform");
+    const savedPlatform = localStorage.getItem('preferredDanmakuPlatform');
     if (savedPlatform) {
       setPreferredDanmakuPlatform(savedPlatform);
     }
-
   }, []);
 
   const currentSourceRef = useRef(currentSource);
@@ -311,12 +320,11 @@ export function usePlayEngine() {
 
     /** ① 用户手动选择某一集（权重大最高） */
     if (selectedDanmakuEpisode !== undefined && selectedState) {
-      matchedEpisode = selectedDanmakuAnime.episodes[selectedDanmakuEpisode - 1];
+      matchedEpisode =
+        selectedDanmakuAnime.episodes[selectedDanmakuEpisode - 1];
       setSelectedState(false);
-    }
-
-    /** ② 自动匹配模式：直接使用第 0 集 */
-    else if (autoDanmakuEnabled) {
+    } else if (autoDanmakuEnabled) {
+      /** ② 自动匹配模式：直接使用第 0 集 */
       matchedEpisode = selectedDanmakuAnime.episodes[0];
     }
 
@@ -327,7 +335,11 @@ export function usePlayEngine() {
 
     // 更新 tooltip（走 DOM setter，不触发面板重建）
     setTimeout(() => {
-      setSettingTooltip(artPlayerRef.current, DANMAKU_SETTING_NAME, matchedEpisode.episodeTitle);
+      setSettingTooltip(
+        artPlayerRef.current,
+        DANMAKU_SETTING_NAME,
+        matchedEpisode.episodeTitle
+      );
     }, 100);
 
     // 加载弹幕 URL
@@ -336,9 +348,12 @@ export function usePlayEngine() {
         const url = await getDanmakuBySelectedAnime(
           selectedDanmakuAnime,
           episodeNumber,
-          "xml"
+          'xml'
         );
-        if (danmukuPluginInstanceRef.current && url !== lastDanmakuUrlRef.current) {
+        if (
+          danmukuPluginInstanceRef.current &&
+          url !== lastDanmakuUrlRef.current
+        ) {
           console.log('动态更新弹幕源:', url);
           danmukuPluginInstanceRef.current.config({ danmuku: url });
           danmukuPluginInstanceRef.current.load();
@@ -360,7 +375,7 @@ export function usePlayEngine() {
           setCurrentTooltip(matchedEpisode.episodeTitle);
         }
       } catch (e) {
-        console.error("获取弹幕 URL 失败:", e);
+        console.error('获取弹幕 URL 失败:', e);
       }
     })();
   }, [currentEpisodeIndex, selectedDanmakuAnime, selectedDanmakuEpisode]);
@@ -712,7 +727,7 @@ export function usePlayEngine() {
       return a.index - b.index;
     });
 
-    const sortedSources = scoredSources.map(item => item.source);
+    const sortedSources = scoredSources.map((item) => item.source);
 
     // 检查是否已取消
     if (isCancelled?.()) {
@@ -779,7 +794,7 @@ export function usePlayEngine() {
           if (inst.option) {
             const next = { ...inst.option };
             if ('mount' in next) next.mount = undefined;
-            if ('danmuku' in next) next.danmuku = "";
+            if ('danmuku' in next) next.danmuku = '';
             danmakuConfigRef.current = next;
           } else if (typeof inst.visible === 'boolean') {
             danmakuConfigRef.current.visible = inst.visible;
@@ -920,6 +935,7 @@ export function usePlayEngine() {
       setSourceSearchError('');
 
       const aggregatedResults: SearchResult[] = [];
+      const targetYear = videoYearRef.current;
 
       try {
         // 发起流式搜索请求
@@ -958,15 +974,9 @@ export function usePlayEngine() {
                 if (data.pageResults) {
                   const filteredResults: SearchResult[] =
                     data.pageResults.filter((r: SearchResult) => {
-                      const titleMatch =
-                        r.title.trim().replace(/\s+/g, ' ').toLowerCase() ===
-                        videoTitleRef.current
-                          .trim()
-                          .replace(/\s+/g, ' ')
-                          .toLowerCase();
-                      const yearMatch = videoYearRef.current
-                        ? r.year.toLowerCase() ===
-                          videoYearRef.current.toLowerCase()
+                      const titleMatch = matchesFullSearchTitle(r.title, query);
+                      const yearMatch = targetYear
+                        ? r.year.toLowerCase() === targetYear.toLowerCase()
                         : true;
                       const typeMatch = searchType
                         ? (searchType === 'tv' && r.episodes.length > 1) ||
@@ -1081,7 +1091,7 @@ export function usePlayEngine() {
       let allResults: SearchResult[] = [];
       let hasInitialized = false; // 标记是否已经初始化过播放数据
 
-      await fetchSourcesData(videoTitle, (newResults) => {
+      await fetchSourcesData(videoTitle || searchTitle, (newResults) => {
         allResults = [...allResults, ...newResults];
 
         // 如果还没确定 detailData，就尝试找目标源
@@ -1142,8 +1152,10 @@ export function usePlayEngine() {
 
   // 视频初始化后即可匹配弹幕
   useEffect(() => {
-    if (isDanmakuPluginReady && isBlockAdChanged){
-      danmukuPluginInstanceRef.current.config({ danmuku: lastDanmakuUrlRef.current });
+    if (isDanmakuPluginReady && isBlockAdChanged) {
+      danmukuPluginInstanceRef.current.config({
+        danmuku: lastDanmakuUrlRef.current,
+      });
       danmukuPluginInstanceRef.current.load();
       setIsBlockAdChanged(false);
       return;
@@ -1178,9 +1190,10 @@ export function usePlayEngine() {
         attempt++;
         try {
           const title = videoTitleRef.current;
-          const currentEpisodeTitle = detail?.episodes_titles?.[currentEpisodeIndex];
+          const currentEpisodeTitle =
+            detail?.episodes_titles?.[currentEpisodeIndex];
           if (!currentEpisodeTitle) {
-            throw new Error("无法获取当前集数标题（episodes_titles 无效）");
+            throw new Error('无法获取当前集数标题（episodes_titles 无效）');
           }
           let epNum = extractEpisodeNumber(currentEpisodeTitle);
           if (!epNum) {
@@ -1213,7 +1226,7 @@ export function usePlayEngine() {
             break;
           } else {
             if (retryCount === -1 || attempt <= retryCount) {
-              await new Promise(res => setTimeout(res, 1500)); // 间隔1.5秒重试
+              await new Promise((res) => setTimeout(res, 1500)); // 间隔1.5秒重试
             }
           }
         } catch (err) {
@@ -1223,12 +1236,12 @@ export function usePlayEngine() {
           }
           console.error(`自动弹幕匹配第${attempt}次失败:`, err);
           if (retryCount === -1 || attempt <= retryCount) {
-            await new Promise(res => setTimeout(res, 1500));
+            await new Promise((res) => setTimeout(res, 1500));
           }
         }
       }
       if (!success) {
-        triggerGlobalError("自动加载弹幕失败，请手动选择弹幕源");
+        triggerGlobalError('自动加载弹幕失败，请手动选择弹幕源');
       }
       if (!abortController.signal.aborted) {
         setIsDanmakuLoading(false);
@@ -1243,7 +1256,12 @@ export function usePlayEngine() {
         abortControllerRef.current = null;
       }
     };
-  }, [currentEpisodeIndex, autoDanmakuEnabled, isDanmakuPluginReady, preferredDanmakuPlatform]);
+  }, [
+    currentEpisodeIndex,
+    autoDanmakuEnabled,
+    isDanmakuPluginReady,
+    preferredDanmakuPlatform,
+  ]);
 
   // -----------------------------------------------------------------------------
   // 播放记录与跳过配置恢复
@@ -1461,7 +1479,9 @@ export function usePlayEngine() {
     triedSourcesRef.current.add(`${candidate.source}:${candidate.id}`);
 
     const notice = `播放失败，已自动切换到「${candidate.source}」`;
-    console.warn(`[auto-switch] ${reason} → ${candidate.source}:${candidate.id}`);
+    console.warn(
+      `[auto-switch] ${reason} → ${candidate.source}:${candidate.id}`
+    );
     try {
       if (artPlayerRef.current) {
         artPlayerRef.current.notice.show = notice;
@@ -1496,14 +1516,21 @@ export function usePlayEngine() {
         saveCurrentPlayProgress();
       }
       if (artPlayerRef.current) {
-        setCurrentTooltip("");
+        setCurrentTooltip('');
       }
       // 检查是否有历史播放记录
       try {
         const allRecords = await getAllPlayRecords();
-        const key = generateStorageKey(currentSourceRef.current, currentIdRef.current);
+        const key = generateStorageKey(
+          currentSourceRef.current,
+          currentIdRef.current
+        );
         const record = allRecords[key];
-        if (record && record.index - 1 === episodeNumber && record.play_time > 0) {
+        if (
+          record &&
+          record.index - 1 === episodeNumber &&
+          record.play_time > 0
+        ) {
           resumeTimeRef.current = record.play_time;
         } else {
           resumeTimeRef.current = 0;
@@ -1524,8 +1551,8 @@ export function usePlayEngine() {
       if (artPlayerRef.current && !artPlayerRef.current.paused) {
         saveCurrentPlayProgress();
       }
-      if(artPlayerRef.current){
-        setCurrentTooltip("");
+      if (artPlayerRef.current) {
+        setCurrentTooltip('');
       }
       setCurrentEpisodeIndex(idx - 1);
     }
@@ -1540,8 +1567,8 @@ export function usePlayEngine() {
       if (artPlayerRef.current && !artPlayerRef.current.paused) {
         saveCurrentPlayProgress();
       }
-      if(artPlayerRef.current){
-        setCurrentTooltip("");
+      if (artPlayerRef.current) {
+        setCurrentTooltip('');
       }
       setCurrentEpisodeIndex(idx + 1);
     }
@@ -1771,8 +1798,9 @@ export function usePlayEngine() {
         if (!mounted) return;
         artLibRef.current = Art;
         hlsLibRef.current = Hls;
-        danmukuPluginRef.current =
-          wrapArtplayerPluginDanmuku(artplayerPluginDanmuku);
+        danmukuPluginRef.current = wrapArtplayerPluginDanmuku(
+          artplayerPluginDanmuku
+        );
         setLibsReady(true);
       } catch (err) {
         console.error('加载播放器库失败:', err);
@@ -1799,8 +1827,7 @@ export function usePlayEngine() {
       detail.episodes &&
       detail.episodes.length > 0 &&
       currentEpisodeIndex !== null &&
-      (currentEpisodeIndex < 0 ||
-        currentEpisodeIndex >= detail.episodes.length)
+      (currentEpisodeIndex < 0 || currentEpisodeIndex >= detail.episodes.length)
     ) {
       setCurrentEpisodeIndex(
         currentEpisodeIndex < 0 ? 0 : detail.episodes.length - 1
@@ -1901,13 +1928,35 @@ export function usePlayEngine() {
        * 内部会无条件 `render()` 把设置面板弹回根面板，导致用户刚点进
        * 「画质」子面板就被踢出来，需要连点很多次。详见 `artplayer-setting.ts`。
        */
+      let lastCacheTooltip = '';
       const updateCacheTooltip = (text: string, switchState?: boolean) => {
         const art = artPlayerRef.current;
         if (!art) return;
-        setSettingTooltip(art, CACHE_SETTING_NAME, text);
+        if (text !== lastCacheTooltip) {
+          setSettingTooltip(art, CACHE_SETTING_NAME, text);
+          lastCacheTooltip = text;
+        }
         if (switchState !== undefined) {
           setSettingSwitch(art, CACHE_SETTING_NAME, switchState);
         }
+      };
+
+      let cacheBandwidthThrottled = false;
+      let lastBufferCheckAt = 0;
+      const setCacheBandwidthThrottled = (value: boolean) => {
+        cacheBandwidthThrottled = value;
+        prefetcherRef.current.setThrottled(value);
+        getNextEpisodePrefetcher().setThrottled(value);
+      };
+      const syncCacheBandwidth = (force = false) => {
+        const video = artPlayerRef.current?.video;
+        if (!video) return;
+        const now = Date.now();
+        if (!force && now - lastBufferCheckAt < 1_000) return;
+        lastBufferCheckAt = now;
+        setCacheBandwidthThrottled(
+          shouldThrottlePrefetch(video, cacheBandwidthThrottled)
+        );
       };
 
       /**
@@ -1924,6 +1973,7 @@ export function usePlayEngine() {
         currentTime: number,
         horizonSeconds?: number
       ) => {
+        if (artPlayerRef.current?.video?.seeking) return;
         const clearing = cacheClearPromiseRef.current;
         if (clearing) {
           const episodeIndex = currentEpisodeIndexRef.current;
@@ -1941,6 +1991,13 @@ export function usePlayEngine() {
         prefetcherRef.current.ensure({
           m3u8Url,
           currentTime,
+          lookBehindSeconds: 0,
+          skipIntroSeconds: skipConfigRef.current.enable
+            ? Math.max(0, skipConfigRef.current.intro_time)
+            : 0,
+          skipOutroSeconds: skipConfigRef.current.enable
+            ? Math.max(0, -skipConfigRef.current.outro_time)
+            : 0,
           title: videoTitleRef.current || '未知影片',
           source:
             detailRef.current?.source_name ||
@@ -1961,6 +2018,7 @@ export function usePlayEngine() {
             if (stats.state === 'done') warmupNextEpisode();
           },
         });
+        syncCacheBandwidth(true);
       };
 
       /**
@@ -1969,10 +2027,14 @@ export function usePlayEngine() {
        * 走独立的预取器实例，因此**不会**打断当前集的队列。
        * 只在当前集队列跑到 `done` 时触发一次（由 `nextWarmupKeyRef` 去重），
        * 并且随集数/画质变化自动失效。
+       *
+       * 并发取用户档位的一半（`getWarmupConcurrency`）：预热是二等消费者，
+       * 播放器 seek / 换档仍要抢带宽；共享下载额度保证两轮之和仍受档位封顶。
        */
       const warmupNextEpisode = () => {
         if (cacheClearPromiseRef.current) return;
-        if (!loadCacheSettings().enabled) return;
+        const settings = loadCacheSettings();
+        if (!settings.enabled) return;
 
         const data = detailRef.current;
         const episodes = data?.episodes;
@@ -1986,13 +2048,24 @@ export function usePlayEngine() {
 
         const preferred = preferredHeightRef.current;
         // 画质档位也是预热键的一部分：换了档位，预热过的分片 URL 就不同了
-        const key = `${currentSourceRef.current}:${currentIdRef.current}:${nextIndex}:${preferred ?? 'auto'}`;
+        const skip = skipConfigRef.current;
+        const skipIntroSeconds = skip.enable ? Math.max(0, skip.intro_time) : 0;
+        const skipOutroSeconds = skip.enable
+          ? Math.max(0, -skip.outro_time)
+          : 0;
+        const key = `${currentSourceRef.current}:${
+          currentIdRef.current
+        }:${nextIndex}:${
+          preferred ?? 'auto'
+        }:${skipIntroSeconds}:${skipOutroSeconds}`;
         if (nextWarmupKeyRef.current === key) return;
         nextWarmupKeyRef.current = key;
 
         getNextEpisodePrefetcher().ensure({
           m3u8Url: nextUrl,
           currentTime: 0,
+          skipIntroSeconds,
+          skipOutroSeconds,
           title: videoTitleRef.current || '未知影片',
           source:
             detailRef.current?.source_name ||
@@ -2001,8 +2074,10 @@ export function usePlayEngine() {
           episodeKey: `${currentSourceRef.current}:${currentIdRef.current}:${nextIndex}`,
           preferredHeight: preferred,
           horizonSeconds: NEXT_EPISODE_HORIZON_SECONDS,
-          useProxy: loadCacheSettings().useProxy,
+          useProxy: settings.useProxy,
+          concurrency: getWarmupConcurrency(settings.concurrency),
         });
+        syncCacheBandwidth(true);
       };
 
       /**
@@ -2024,10 +2099,17 @@ export function usePlayEngine() {
         low: '低档',
         medium: '中档',
         high: '高档',
-        custom: '自定义',
       };
       const restartCacheQueue = () => {
         prefetcherRef.current.stop();
+        getNextEpisodePrefetcher().stop();
+        nextWarmupKeyRef.current = null;
+        if (loadCacheSettings().enabled) {
+          ensurePrefetchCurrent(artPlayerRef.current?.currentTime || 0);
+        }
+      };
+      restartPrefetchForSkipRef.current = () => {
+        prefetcherRef.current.stop(true);
         getNextEpisodePrefetcher().stop();
         nextWarmupKeyRef.current = null;
         if (loadCacheSettings().enabled) {
@@ -2111,9 +2193,7 @@ export function usePlayEngine() {
         moreVideoAttr: {
           crossOrigin: 'anonymous',
         },
-        plugins: [
-          danmukuPluginRef.current(danmakuConfigRef.current),
-        ],
+        plugins: [danmukuPluginRef.current(danmakuConfigRef.current)],
         // HLS 支持配置
         customType: {
           m3u8: function (video: HTMLVideoElement, url: string) {
@@ -2127,11 +2207,8 @@ export function usePlayEngine() {
             }
             const hls = new Hls({
               debug: false, // 关闭日志
-              enableWorker: false, // 必须关闭 Worker：Fragment 加载在 Worker 里拿不到 Cache Storage，
-                                  // 也不会调用主线程里写了「缓存优先」的 CustomHlsLoader，
-                                  // 会导致 Cache Storage 里明明写满了数据但播放时全走网络。
-                                  // 90MB 的 maxBufferSize + Cache Storage 前向预取已经足够稳，
-                                  // 放弃 Worker 换缓存命中收益性价比更高。
+              // 分片处理移到 Worker；自定义 loader 仍在主线程读取缓存。
+              enableWorker: true,
 
               // VOD 场景关闭低延迟模式：LL-HLS 会主动压缩前向缓冲，与"多缓存"目标相悖
               lowLatencyMode: false,
@@ -2177,27 +2254,30 @@ export function usePlayEngine() {
               syncQualitySetting(hls);
             });
 
-            hls.on(Hls.Events.LEVEL_SWITCHED, function (_event: any, data: any) {
-              const level = hls.levels?.[data?.level];
-              updateQualityTooltip(
-                hls.autoLevelEnabled
-                  ? `自动${level ? ` · ${describeLevel(level)}` : ''}`
-                  : describeLevel(level)
-              );
+            hls.on(
+              Hls.Events.LEVEL_SWITCHED,
+              function (_event: any, data: any) {
+                const level = hls.levels?.[data?.level];
+                updateQualityTooltip(
+                  hls.autoLevelEnabled
+                    ? `自动${level ? ` · ${describeLevel(level)}` : ''}`
+                    : describeLevel(level)
+                );
 
-              // 暂停状态下切换档位时，浏览器不会自动重绘新解码的帧，
-              // 画面会停在旧档位，用户容易误判成"切了没反应"。
-              // 用一次 10ms 的微 seek 强制刷新——偏移落在同一分片内，
-              // 不会触发重新加载。
-              const media = artPlayerRef.current?.video;
-              if (media?.paused && media.currentTime > 0.05) {
-                try {
-                  media.currentTime = media.currentTime - 0.01;
-                } catch {
-                  // 忽略：极端情况下媒体尚未就绪
+                // 暂停状态下切换档位时，浏览器不会自动重绘新解码的帧，
+                // 画面会停在旧档位，用户容易误判成"切了没反应"。
+                // 用一次 10ms 的微 seek 强制刷新——偏移落在同一分片内，
+                // 不会触发重新加载。
+                const media = artPlayerRef.current?.video;
+                if (media?.paused && media.currentTime > 0.05) {
+                  try {
+                    media.currentTime = media.currentTime - 0.01;
+                  } catch {
+                    // 忽略：极端情况下媒体尚未就绪
+                  }
                 }
               }
-            });
+            );
 
             // 分片加载成功（含命中本项目的片段缓存）即视为链路仍在推进
             hls.on(Hls.Events.FRAG_LOADED, function () {
@@ -2369,7 +2449,9 @@ export function usePlayEngine() {
             onSelect: function (item: any) {
               const value = Number(item.value);
               const hls = artPlayerRef.current?.video?.hls;
-              const levels: any[] = Array.isArray(hls?.levels) ? hls.levels : [];
+              const levels: any[] = Array.isArray(hls?.levels)
+                ? hls.levels
+                : [];
 
               const isAuto = value === AUTO_LEVEL || Number.isNaN(value);
               const isMax = value === MAX_LEVEL;
@@ -2445,12 +2527,11 @@ export function usePlayEngine() {
           {
             name: '缓存模式',
             html: '缓存模式',
-            tooltip: `${cacheModeLabels[loadCacheSettings().concurrencyMode]} · ${loadCacheSettings().concurrency} 个`,
-            selector: (['low', 'medium', 'high', 'custom'] as const).map((mode) => ({
-              html:
-                mode === 'custom'
-                  ? '自定义'
-                  : `${cacheModeLabels[mode]}（${{ low: 3, medium: 6, high: 9 }[mode]} 个）`,
+            tooltip: `${
+              cacheModeLabels[loadCacheSettings().concurrencyMode]
+            } · ${loadCacheSettings().concurrency} 个`,
+            selector: (['low', 'medium', 'high'] as const).map((mode) => ({
+              html: `${cacheModeLabels[mode]}（${CACHE_CONCURRENCY_PRESETS[mode]} 个）`,
               value: mode,
               default: mode === loadCacheSettings().concurrencyMode,
             })),
@@ -2459,36 +2540,9 @@ export function usePlayEngine() {
                 concurrencyMode: item.value,
               });
               restartCacheQueue();
-              return `${cacheModeLabels[settings.concurrencyMode]} · ${settings.concurrency} 个`;
-            },
-          },
-          {
-            name: '自定义缓存并发',
-            html: '自定义并发',
-            tooltip: `${loadCacheSettings().customConcurrency} 个`,
-            range: [loadCacheSettings().customConcurrency, 1, 32, 1],
-            onChange: function (item: any) {
-              return `${item.range[0]} 个`;
-            },
-            onRange: function (item: any) {
-              const settings = saveCacheSettings({
-                concurrencyMode: 'custom',
-                customConcurrency: Number(item.range[0]),
-              });
-              updateSettingPreservingPanel(artPlayerRef.current, {
-                name: '缓存模式',
-                tooltip: `自定义 · ${settings.concurrency} 个`,
-                selector: (['low', 'medium', 'high', 'custom'] as const).map((mode) => ({
-                  html:
-                    mode === 'custom'
-                      ? '自定义'
-                      : `${cacheModeLabels[mode]}（${{ low: 3, medium: 6, high: 9 }[mode]} 个）`,
-                  value: mode,
-                  default: mode === 'custom',
-                })),
-              });
-              restartCacheQueue();
-              return `${settings.concurrency} 个`;
+              return `${cacheModeLabels[settings.concurrencyMode]} · ${
+                settings.concurrency
+              } 个`;
             },
           },
           {
@@ -2586,6 +2640,7 @@ export function usePlayEngine() {
       // 监听播放状态变化，控制 Wake Lock
       artPlayerRef.current.on('play', () => {
         requestWakeLock();
+        syncCacheBandwidth(true);
       });
 
       artPlayerRef.current.on('pause', () => {
@@ -2599,7 +2654,7 @@ export function usePlayEngine() {
         //    缓存铺得越远；字节上限与 LRU 淘汰才是这条路的兜底。
         //    走 ensurePrefetchCurrent 而不是闭包里的 videoUrl——播放器跨集复用，
         //    闭包里的地址可能是上一集的。
-        prefetcherRef.current.setThrottled(false);
+        setCacheBandwidthThrottled(false);
         ensurePrefetchCurrent(
           artPlayerRef.current.currentTime || 0,
           UNLIMITED_HORIZON_SECONDS
@@ -2609,15 +2664,20 @@ export function usePlayEngine() {
       // ---------------------------------------------------------------------
       // 前向预缓存：窗口维护
       // ---------------------------------------------------------------------
-      // seek 后窗口可能不再覆盖目标位置；ensure 内部会判断，窗口够用时零成本返回
+      // 跳转开始即中止旧请求，保留统计和已写入缓存；落点确定后重新排队。
+      artPlayerRef.current.on('video:seeking', () => {
+        prefetcherRef.current.stop(true);
+        setCacheBandwidthThrottled(true);
+      });
       artPlayerRef.current.on('video:seeked', () => {
+        prefetcherRef.current.stop(true);
         ensurePrefetchCurrent(artPlayerRef.current.currentTime || 0);
       });
 
       // 播放卡顿时让出带宽，恢复后继续预取。
       // 注意：这是"临时让路"，不是"视频暂停就停缓存"。
       artPlayerRef.current.on('video:waiting', () => {
-        prefetcherRef.current.setThrottled(true);
+        setCacheBandwidthThrottled(!artPlayerRef.current?.video?.paused);
 
         // —— 弱网自动降档 ——
         // seek/换源也会触发 waiting，因此 5 秒内的重复事件只记一次；
@@ -2639,8 +2699,8 @@ export function usePlayEngine() {
           typeof hls.loadLevel === 'number' && hls.loadLevel >= 0
             ? hls.loadLevel
             : typeof hls.currentLevel === 'number' && hls.currentLevel >= 0
-              ? hls.currentLevel
-              : 0;
+            ? hls.currentLevel
+            : 0;
         const cap =
           typeof hls.autoLevelCapping === 'number' && hls.autoLevelCapping >= 0
             ? hls.autoLevelCapping
@@ -2665,8 +2725,9 @@ export function usePlayEngine() {
         }
       });
       artPlayerRef.current.on('video:playing', () => {
-        prefetcherRef.current.setThrottled(false);
+        syncCacheBandwidth(true);
       });
+      artPlayerRef.current.on('video:progress', () => syncCacheBandwidth());
 
       // 如果播放器初始化时已经在播放状态，则请求 Wake Lock
       if (artPlayerRef.current && !artPlayerRef.current.paused) {
@@ -2723,6 +2784,7 @@ export function usePlayEngine() {
       // （两个逻辑合并到同一个监听器，避免重复注册 timeupdate）
       artPlayerRef.current.on('video:timeupdate', () => {
         const now = Date.now();
+        syncCacheBandwidth();
 
         // —— 播放进度自动保存 ——
         // 间隔优先读取站点配置（RUNTIME_CONFIG.PLAYBACK_SAVE_INTERVAL，单位秒），
@@ -2913,7 +2975,10 @@ export function usePlayEngine() {
       setPreview((p) => ({
         visible: true,
         time,
-        left: ratio * 100,
+        left:
+          input === 'touch' || artLibRef.current?.utils?.isMobile
+            ? 50
+            : ratio * 100,
         image: p?.visible ? p.image : null,
       }));
       if (input === 'touch') {
@@ -2925,7 +2990,8 @@ export function usePlayEngine() {
       const id = ++previewRequestIdRef.current;
       previewThumbnailerRef.current?.cancel();
 
-      if (previewTimerRef.current != null) clearTimeout(previewTimerRef.current);
+      if (previewTimerRef.current != null)
+        clearTimeout(previewTimerRef.current);
       previewTimerRef.current = window.setTimeout(() => {
         previewTimerRef.current = null;
         const thumb = previewThumbnailerRef.current;
@@ -2956,7 +3022,8 @@ export function usePlayEngine() {
     };
 
     const onDragMove = (event: Event) => {
-      const { ratio, input } = (event as CustomEvent<ProgressPreviewMove>).detail;
+      const { ratio, input } = (event as CustomEvent<ProgressPreviewMove>)
+        .detail;
       if (!dragging && input === 'touch') hidePreview();
       dragging = true;
       showPreview(ratio, input);
@@ -2994,7 +3061,11 @@ export function usePlayEngine() {
   useEffect(() => {
     // 监听页面可见性变化
     const handleVisibilityChange = () => {
-      if (!document.hidden && artPlayerRef.current && !artPlayerRef.current.paused) {
+      if (
+        !document.hidden &&
+        artPlayerRef.current &&
+        !artPlayerRef.current.paused
+      ) {
         // 页面变为可见且视频正在播放时，重新请求 Wake Lock
         requestWakeLock();
       } else if (document.hidden) {
@@ -3023,6 +3094,7 @@ export function usePlayEngine() {
       document.removeEventListener('visibilitychange', handleVisibilityChange);
 
       // 停止前向预缓存（含下一集预热队列）
+      restartPrefetchForSkipRef.current = null;
       prefetcherRef.current.stop();
       getNextEpisodePrefetcher().stop();
 
@@ -3035,10 +3107,7 @@ export function usePlayEngine() {
   // 弹幕选择回调（供渲染层绑定 DanmakuSelector）
   // -----------------------------------------------------------------------------
 
-  const handleDanmakuSelect = (
-    anime: AnimeOption,
-    episodeNumber?: number
-  ) => {
+  const handleDanmakuSelect = (anime: AnimeOption, episodeNumber?: number) => {
     const sourceName = anime.animeTitle;
     setSelectedDanmakuSource(sourceName);
     selectedDanmakuSourceRef.current = sourceName;
@@ -3051,7 +3120,11 @@ export function usePlayEngine() {
   const handleDanmakuClose = () => {
     setShowDanmakuSelector(false);
     // 更新 tooltip（走 DOM setter，不触发面板重建）
-    setSettingTooltip(artPlayerRef.current, DANMAKU_SETTING_NAME, currentTooltip || '未选择');
+    setSettingTooltip(
+      artPlayerRef.current,
+      DANMAKU_SETTING_NAME,
+      currentTooltip || '未选择'
+    );
   };
 
   // -----------------------------------------------------------------------------
